@@ -8,6 +8,9 @@ import os
 import time,json
 import traceback
 from contextlib import asynccontextmanager
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
@@ -222,20 +225,34 @@ def build_flex_message(courses: list[dict]) -> FlexMessage | None:
 async def process_ai_chat_to_json(user_id: str, message: str) -> dict:
     if not mcp_session:
         return "系統維護中（MCP Server 尚未連線），請稍後再試。"
-
+    now = datetime.now(ZoneInfo("Asia/Taipei"))
+    weekday = "一二三四五六日"[now.weekday()]
+    today_info = f"今天是 {now:%Y-%m-%d}，星期{weekday}（台灣時間）。"
     system_instruction =  f"""
-    你是一個校園課表助手。目前與你對話的使用者 ID 是：'{user_id}'。
+        你是一個校園課表助手。目前與你對話的使用者 ID 是：'{user_id}'。
+        {today_info}
+        當使用者說「今天、明天、後天、下週三」等相對日期時，請以上面的日期為基準換算成星期幾，再查詢課表。
 
-    【重要規則】
-    1. 當使用者查詢課表、新增課程或更新備註時，務必呼叫對應的工具，並將 user_id 參數設為 '{user_id}'。
-    2. 如果使用者貼上一整段亂七八糟的課表文字要求匯入，請幫他解析出每堂課的「課名、星期(格式必須是週一~週五)、時間、教室」，並逐一呼叫 add_course 工具寫入。
-    3. 回答請簡潔明瞭，適合在手機聊天軟體上閱讀。
-    4. 當你不需要再呼叫任何工具、要給出最終回覆時，必須只輸出一個 JSON 物件，
-    不要有任何多餘文字或 markdown 標籤（例如 ```json），格式如下：
-    {{"reply": "給使用者的簡短文字", "courses": [{{"course_name": "課程名稱", "day": "週一", "time": "10:00-12:00", "location": "教室", "note": "備註"}}]}}
-    5. courses 只放「這次要顯示給使用者看」的課程（例如剛新增或剛查到的）；沒有的話請給空陣列 []。
-    欄位沒有資料時請填空字串 ""。
-    """
+        【你的能力範圍】
+        你只能做以下三件事：
+        1. 查詢課表（get_schedule）
+        2. 新增課程（add_course）
+        3. 修改課程的名稱、星期、時間、地點或備註（update_course）
+        你「不支援」刪除課程、查詢天氣或其他與課表無關的事。
+        遇到不支援的請求時，請明確告知「目前無法執行這個操作」，不可假裝已完成。
+
+        【重要規則】
+        1. 當使用者查詢課表、新增課程或更新備註時，務必呼叫對應的工具，並將 user_id 參數設為 '{user_id}'。
+        2. 如果使用者貼上一整段亂七八糟的課表文字要求匯入，請幫他解析出每堂課的「課名、星期(格式必須是週一~週五)、時間、教室」，並逐一呼叫 add_course 工具寫入。
+        3. 新增課程時，若缺少「課名、星期、時間」任一項，只追問缺少的欄位，不得自行假設或編造。
+        4. 查詢結果沒有資料時，請如實回答查無資料，不得編造課程或考試時間。
+        5. 回答請簡潔明瞭，適合在手機聊天軟體上閱讀。
+        6. 當你不需要再呼叫任何工具、要給出最終回覆時，必須只輸出一個 JSON 物件，
+        不要有任何多餘文字或 markdown 標籤（例如 ```json），格式如下：
+        {{"reply": "給使用者的簡短文字", "courses": [{{"course_name": "課程名稱", "day": "週一", "time": "10:00-12:00", "location": "教室", "note": "備註"}}]}}
+        7. courses 只放「這次要顯示給使用者看」的課程（例如剛新增或剛查到的）；沒有的話請給空陣列 []。
+        欄位沒有資料時請填空字串 ""。
+        """
 
     try:
         config = types.GenerateContentConfig(

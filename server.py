@@ -5,6 +5,7 @@ server.py 檔案自己獨立出來:
 '''
 import os
 import psycopg2
+import re
 from psycopg2.extras import RealDictCursor
 from mcp.server.mcpserver import MCPServer
 
@@ -81,30 +82,93 @@ def add_course(user_id: str, course_name: str, day_of_week: str, time_slot: str,
         
     return f"已成功新增課程：{day_of_week} {time_slot}《{course_name}》於 {location}。"
 
+VALID_DAYS = {"週一", "週二", "週三", "週四", "週五", "週六", "週日"}
+
 @mcp.tool()
-def update_course_note(user_id: str, course_name: str, note: str) -> str:
+def update_course(
+    user_id: str,
+    course_name: str,
+    new_course_name: str = "",
+    new_day_of_week: str = "",
+    new_time_slot: str = "",
+    new_location: str = "",
+    new_note: str = "",
+) -> str:
     """
-    更新特定課程的備註（例如作業提醒、調課通知、考試時間）。
+    更新特定課程的資訊，可修改課程名稱、上課星期、上課時間、上課地點、備註。
+    只需要提供要修改的欄位，沒提供（留空）的欄位不會被更動。
     :param user_id: 使用者的唯一識別碼
-    :param course_name: 課程名稱
-    :param note: 要寫入的備註內容
+    :param course_name: 要修改的「目前」課程名稱，請盡量使用完整課名
+    :param new_course_name: 新的課程名稱（不改名請留空）
+    :param new_day_of_week: 新的上課星期，格式必須是 '週一'~'週日'（不改請留空）
+    :param new_time_slot: 新的上課時間，格式為 'HH:MM-HH:MM'，例如 '13:20-16:20'（不改請留空）
+    :param new_location: 新的上課地點（不改地點請留空）
+    :param new_note: 新的備註內容，會覆蓋舊備註（不改備註請留空）
     """
+    if not any([new_course_name, new_day_of_week, new_time_slot, new_location, new_note]):
+        return "沒有提供任何要修改的內容，未做任何更動。"
+
+    # 格式驗證：不合格就回報錯誤，讓 Agent 修正後重試
+    if new_day_of_week and new_day_of_week not in VALID_DAYS:
+        return f"星期格式錯誤：「{new_day_of_week}」，請使用 週一~週日，本次未做任何更動。"
+    if new_time_slot and not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d-([01]\d|2[0-3]):[0-5]\d", new_time_slot):
+        return f"時間格式錯誤：「{new_time_slot}」，請使用 HH:MM-HH:MM（例如 13:20-16:20），本次未做任何更動。"
+
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
+        # 1. 找出符合的課程（同名課程可能有多個時段，所以取完整資料）
         cursor.execute(
-            "UPDATE courses SET notes = %s WHERE user_id = %s AND course_name LIKE %s",
-            (note, user_id, f"%{course_name}%")
+            "SELECT id, course_name, day_of_week, time_slot FROM courses WHERE user_id = %s AND course_name LIKE %s",
+            (user_id, f"%{course_name}%"),
         )
-        affected = cursor.rowcount
+        rows = cursor.fetchall()
+
+        # 2. 精確比對優先，其次唯一模糊命中
+        exact = [r for r in rows if r["course_name"] == course_name]
+        candidates = exact if exact else rows
+        distinct_names = sorted({r["course_name"] for r in candidates})
+
+        if not candidates:
+            return f"找不到名稱包含「{course_name}」的課程，無法更新。"
+        if len(distinct_names) > 1:
+            return f"找到多門課程：{'、'.join(distinct_names)}，請指定要修改哪一門，本次未做任何更動。"
+        if len(candidates) > 1:
+            slots = "、".join(f"{r['day_of_week']} {r['time_slot']}" for r in candidates)
+            return f"《{distinct_names[0]}》有多個上課時段：{slots}，請指定要修改哪一個時段，本次未做任何更動。"
+
+        target = candidates[0]
+
+        # 3. 只更新有提供的欄位（欄位名稱為寫死，值走參數化）
+        fields, params = [], []
+        if new_course_name:
+            fields.append("course_name = %s"); params.append(new_course_name)
+        if new_day_of_week:
+            fields.append("day_of_week = %s"); params.append(new_day_of_week)
+        if new_time_slot:
+            fields.append("time_slot = %s"); params.append(new_time_slot)
+        if new_location:
+            fields.append("location = %s"); params.append(new_location)
+        if new_note:
+            fields.append("notes = %s"); params.append(new_note)
+
+        params.extend([user_id, target["id"]])
+        cursor.execute(
+            f"UPDATE courses SET {', '.join(fields)} WHERE user_id = %s AND id = %s",
+            params,
+        )
         conn.commit()
     finally:
         cursor.close()
         conn.close()
 
-    if affected == 0:
-        return f"找不到名稱包含「{course_name}」的課程，無法更新備註。"
-    return f"已將《{course_name}》的備註更新為：{note}"
+    changes = []
+    if new_course_name: changes.append(f"課名改為《{new_course_name}》")
+    if new_day_of_week: changes.append(f"星期改為 {new_day_of_week}")
+    if new_time_slot: changes.append(f"時間改為 {new_time_slot}")
+    if new_location: changes.append(f"地點改為 {new_location}")
+    if new_note: changes.append(f"備註改為：{new_note}")
+    return f"已更新《{target['course_name']}》：" + "、".join(changes) + "。"
 
 if __name__ == "__main__":
     mcp.run()
