@@ -5,18 +5,10 @@
 
 
 
-## 🎬 Demo
+##  Demo
 
-
-`暫時`
-
-| 查詢課表（Flex Message） | 新增備忘 | 查空堂 |
-|---|---|---|
-| ![schedule](docs/schedule.png) | ![note](docs/note.png) | ![free](docs/free.png) |
-
-**Live Demo**：加入 LINE 官方帳號測試 → `暫時`（或掃描 QR Code）
-
-<!-- ![qrcode](docs/qrcode.png) -->
+![alt text](image-2.png)
+![alt text](image-5.png)
 
 ## ✨ 功能特色
 
