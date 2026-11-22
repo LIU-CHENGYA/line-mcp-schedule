@@ -3,10 +3,9 @@
 main.py 是一個對外提供服務的網站後端（讓前端或使用者傳訊息進來）。它要接收使用者的請求、呼叫 Google Gemini AI、並且在 AI 需要工具時，
 由內建的 Client 去跟獨立的 Server 溝通。所以 Client 自然會和你的網站主邏輯（main.py）寫在一起。
 '''
-
 import asyncio
 import os
-import time
+import time,json
 import traceback
 from contextlib import asynccontextmanager
 
@@ -20,14 +19,17 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 # 新增：引入 LINE Bot SDK v3 相關模組
-from linebot.v3 import WebhookParser
+from linebot.v3 import WebhookParser,WebhookHandler
 from linebot.v3.exceptions import InvalidSignatureError
 from linebot.v3.messaging import (
-    ApiClient,
+    AsyncApiClient,
+    AsyncMessagingApi,
     Configuration,
-    MessagingApi,
+    AsyncMessagingApi,
     ReplyMessageRequest,
     TextMessage,
+    FlexMessage,
+    FlexContainer
 )
 from linebot.v3.webhooks import MessageEvent, TextMessageContent
 
@@ -123,20 +125,115 @@ async def generate_with_retry(contents, config):
 
 
 # =====================================================================
-# 核心 AI 對話邏輯（抽成共用函式，讓 /chat 和 LINE Webhook 都能呼叫）
+# 工具函式：解析 AI 的 JSON 回覆 / 產生 Flex Message
 # =====================================================================
-async def process_ai_chat(user_id: str, message: str) -> str:
+def _reply(text: str) -> dict:
+    """統一的回傳格式：只有文字、沒有課程卡片。"""
+    return {"reply": text, "courses": []}
+
+
+def parse_ai_json(text: str) -> dict:
+    """把 AI 回的文字解析成 {"reply": str, "courses": list[dict]}。
+    解析失敗時，把整段文字當成一般回覆，不會讓程式壞掉。"""
+    cleaned = (text or "").strip()
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start != -1 and end > start:
+        try:
+            data = json.loads(cleaned[start : end + 1])
+            if isinstance(data, dict):
+                courses = data.get("courses") or []
+                return {
+                    "reply": str(data.get("reply") or ""),
+                    "courses": [c for c in courses if isinstance(c, dict)],
+                }
+        except json.JSONDecodeError:
+            pass
+    return _reply(cleaned or "已完成處理。")
+
+
+def build_course_bubble(course: dict) -> dict:
+    """依照單一課程資料產生一張 Flex bubble（直接組 dict，不靠寫死的索引）。"""
+
+    def row(label: str, value) -> dict:
+        return {
+            "type": "box",
+            "layout": "baseline",
+            "spacing": "sm",
+            "contents": [
+                {"type": "text", "text": label, "color": "#aaaaaa", "size": "sm", "flex": 1},
+                {
+                    "type": "text",
+                    # LINE 不接受空字串，所以一定要給預設值
+                    "text": str(value).strip() if value else "未填寫",
+                    "wrap": True,
+                    "color": "#666666",
+                    "size": "sm",
+                    "flex": 4,
+                },
+            ],
+        }
+
+    return {
+        "type": "bubble",
+        "body": {
+            "type": "box",
+            "layout": "vertical",
+            "contents": [
+                {
+                    "type": "text",
+                    "text": str(course.get("course_name") or "未命名課程"),
+                    "weight": "bold",
+                    "size": "xl",
+                    "wrap": True,
+                },
+                {
+                    "type": "box",
+                    "layout": "vertical",
+                    "margin": "lg",
+                    "spacing": "sm",
+                    "contents": [
+                        row("星期", course.get("day")),
+                        row("時間", course.get("time")),
+                        row("教室", course.get("location")),
+                        row("備註", course.get("note")),
+                    ],
+                },
+            ],
+        },
+    }
+
+
+def build_flex_message(courses: list[dict]) -> FlexMessage | None:
+    """一堂課 -> bubble；多堂課 -> carousel（LINE 上限 12 張）。"""
+    if not courses:
+        return None
+    bubbles = [build_course_bubble(c) for c in courses[:12]]
+    container = bubbles[0] if len(bubbles) == 1 else {"type": "carousel", "contents": bubbles}
+    return FlexMessage(
+        alt_text="您的課程資訊",
+        contents=FlexContainer.from_dict(container),
+    )
+
+
+# =====================================================================
+# 核心 AI 對話邏輯：一律回傳 dict {"reply": str, "courses": list}
+# =====================================================================
+async def process_ai_chat_to_json(user_id: str, message: str) -> dict:
     if not mcp_session:
         return "系統維護中（MCP Server 尚未連線），請稍後再試。"
 
-    system_instruction = f"""
-    你是一個親切的校園課表與學習助理。
-    目前與你對話的使用者 ID 是：'{user_id}'。
+    system_instruction =  f"""
+    你是一個校園課表助手。目前與你對話的使用者 ID 是：'{user_id}'。
 
     【重要規則】
     1. 當使用者查詢課表、新增課程或更新備註時，務必呼叫對應的工具，並將 user_id 參數設為 '{user_id}'。
     2. 如果使用者貼上一整段亂七八糟的課表文字要求匯入，請幫他解析出每堂課的「課名、星期(格式必須是週一~週五)、時間、教室」，並逐一呼叫 add_course 工具寫入。
     3. 回答請簡潔明瞭，適合在手機聊天軟體上閱讀。
+    4. 當你不需要再呼叫任何工具、要給出最終回覆時，必須只輸出一個 JSON 物件，
+    不要有任何多餘文字或 markdown 標籤（例如 ```json），格式如下：
+    {{"reply": "給使用者的簡短文字", "courses": [{{"course_name": "課程名稱", "day": "週一", "time": "10:00-12:00", "location": "教室", "note": "備註"}}]}}
+    5. courses 只放「這次要顯示給使用者看」的課程（例如剛新增或剛查到的）；沒有的話請給空陣列 []。
+    欄位沒有資料時請填空字串 ""。
     """
 
     try:
@@ -150,7 +247,7 @@ async def process_ai_chat(user_id: str, message: str) -> str:
         contents: list[types.Content] = [
             types.Content(role="user", parts=[types.Part(text=message)])
         ]
-
+        
         started = time.perf_counter()
         for _ in range(MAX_TOOL_ROUNDS):
             if time.perf_counter() - started > TOTAL_TIMEOUT:
@@ -159,7 +256,7 @@ async def process_ai_chat(user_id: str, message: str) -> str:
 
             calls = response.function_calls
             if not calls:
-                return response.text or "已完成處理。"
+                return parse_ai_json(response.text or "")
 
             contents.append(response.candidates[0].content)
 
@@ -196,7 +293,7 @@ async def process_ai_chat(user_id: str, message: str) -> str:
 
             contents.append(types.Content(role="user", parts=result_parts))
 
-        return "處理步驟過多，請把需求拆小一點再試一次。"
+        return _reply("處理步驟過多，請把需求拆小一點再試一次。")
 
     except asyncio.TimeoutError:
         print("❌ Gemini 呼叫逾時")
@@ -211,30 +308,42 @@ async def process_ai_chat(user_id: str, message: str) -> str:
 async def chat_with_agent(req: ChatRequest):
     if not mcp_session:
         raise HTTPException(status_code=500, detail="MCP Server 尚未連線")
-    reply_text = await process_ai_chat(req.user_id, req.message)
-    return {"reply": reply_text}
+    result = await process_ai_chat_to_json(req.user_id, req.message)
+    return {"reply": result["reply"], "courses": result["courses"]}
 
 
 # =====================================================================
-# 新增：給 LINE 呼叫的 Webhook 路由 (/callback)
+# # LINE Webhook
 # =====================================================================
-async def handle_line_text_event(event: MessageEvent):
+async def handle_text_message(event: MessageEvent):
     """在背景非同步處理 AI 思考與工具呼叫，完成後用 reply_token 回覆 LINE"""
     user_id = event.source.user_id  # 自動抓出這位 LINE 使用者的專屬 ID！
     user_message = event.message.text
     print(f"📩 收到來自 LINE ({user_id}) 的訊息: {user_message}")
+    try:
+        result = await process_ai_chat_to_json(user_id, user_message)
 
-    reply_text = await process_ai_chat(user_id, user_message)
+        messages = []
+        if result["reply"]:
+            messages.append(TextMessage(text=result["reply"][:5000]))
+        flex = build_flex_message(result["courses"])
+        if flex:
+            messages.append(flex)
+        if not messages:
+            messages.append(TextMessage(text="已完成處理。"))
 
-    with ApiClient(line_configuration) as api_client:
-        line_bot_api = MessagingApi(api_client)
-        line_bot_api.reply_message(
-            ReplyMessageRequest(
-                reply_token=event.reply_token,
-                messages=[TextMessage(text=reply_text)],
+        async with AsyncApiClient(line_configuration) as api_client:
+            line_bot_api = AsyncMessagingApi(api_client)
+            await line_bot_api.reply_message(
+                ReplyMessageRequest(
+                    reply_token=event.reply_token,
+                    messages=messages,
+                )
             )
-        )
-    print(f"📤 已回覆 LINE ({user_id}): {reply_text[:100]}...")
+    except Exception:
+        # 背景任務的錯誤不會顯示在回應裡，一定要自己印出來
+        traceback.print_exc()
+
 
 
 @app.post("/callback")
@@ -255,6 +364,6 @@ async def line_webhook(request: Request, background_tasks: BackgroundTasks):
     for event in events:
         if isinstance(event, MessageEvent) and isinstance(event.message, TextMessageContent):
             # 交給背景任務執行，立刻回傳 200 OK 給 LINE 避免 Webhook 逾時
-            background_tasks.add_task(handle_line_text_event, event)
+            background_tasks.add_task(handle_text_message, event)
 
     return "OK"
