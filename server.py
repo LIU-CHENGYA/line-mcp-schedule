@@ -170,5 +170,69 @@ def update_course(
     if new_note: changes.append(f"備註改為：{new_note}")
     return f"已更新《{target['course_name']}》：" + "、".join(changes) + "。"
 
+
+@mcp.tool()
+def delete_course(
+    user_id: str,
+    course_name: str,
+    day_of_week: str = "",
+    confirm: bool = False,
+) -> str:
+    """
+    刪除使用者課表中的一筆課程。此操作無法復原。
+    必須先以 confirm=False 呼叫取得預覽，並向使用者確認後，才能以 confirm=True 再次呼叫。
+    :param user_id: 使用者的唯一識別碼
+    :param course_name: 要刪除的課程名稱，請盡量使用完整課名
+    :param day_of_week: 該課程的上課星期（'週一'~'週日'）。同一門課有多個時段時，用來指定要刪哪一個，否則留空
+    :param confirm: 使用者已明確表示確認刪除時才設為 True，預設 False 只做預覽
+    """
+    if day_of_week and day_of_week not in VALID_DAYS:
+        return f"星期格式錯誤：「{day_of_week}」，請使用 週一~週日，本次未做任何更動。"
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            "SELECT id, course_name, day_of_week, time_slot, location FROM courses "
+            "WHERE user_id = %s AND course_name LIKE %s",
+            (user_id, f"%{course_name}%"),
+        )
+        rows = cursor.fetchall()
+
+        # 精確比對優先
+        exact = [r for r in rows if r["course_name"] == course_name]
+        candidates = exact if exact else rows
+
+        # 有指定星期就再過濾
+        if day_of_week:
+            candidates = [r for r in candidates if r["day_of_week"] == day_of_week]
+
+        if not candidates:
+            return f"找不到符合「{course_name}」{day_of_week}的課程，無法刪除。"
+
+        distinct_names = sorted({r["course_name"] for r in candidates})
+        if len(distinct_names) > 1:
+            return f"找到多門課程：{'、'.join(distinct_names)}，請指定要刪除哪一門，本次未做任何更動。"
+        if len(candidates) > 1:
+            slots = "、".join(f"{r['day_of_week']} {r['time_slot']}" for r in candidates)
+            return f"《{distinct_names[0]}》有多個上課時段：{slots}，請指定要刪除哪一個時段，本次未做任何更動。"
+
+        target = candidates[0]
+        desc = f"{target['day_of_week']} {target['time_slot']}《{target['course_name']}》@ {target['location']}"
+
+        # 第一次呼叫只預覽，不刪除
+        if not confirm:
+            return f"【待確認】即將刪除：{desc}。請先詢問使用者是否確定刪除，確認後再以 confirm=True 呼叫。目前尚未刪除。"
+
+        cursor.execute(
+            "DELETE FROM courses WHERE user_id = %s AND id = %s",
+            (user_id, target["id"]),
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+
+    return f"已刪除：{desc}。"
 if __name__ == "__main__":
     mcp.run()
