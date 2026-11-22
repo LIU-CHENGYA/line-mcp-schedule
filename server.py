@@ -3,15 +3,21 @@ server.py 檔案自己獨立出來:
     它是一個「工具提供者（外場廚房）」。它專門負責跟特定的資料源互動（例如讀寫資料庫、操作檔案）。
     它被設計成一個獨立的子行程（Subprocess）。當你的主程式需要它時，主程式會透過指令（這裡是用 uv run server.py）把它叫起來。
 '''
-import sqlite3
+import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from mcp.server.mcpserver import MCPServer
 
 # 初始化 MCP Server
 mcp = MCPServer("CampusScheduleServer")
 
 def get_db_connection():
-    conn = sqlite3.connect("schedule.db")
-    conn.row_factory = sqlite3.Row
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise ValueError("找不到 DATABASE_URL 環境變數，請確認已正確設定！")
+    
+    # RealDictCursor 讓查詢結果像字典一樣可用 row['欄位名'] 存取，對應原本的 sqlite3.Row
+    conn = psycopg2.connect(database_url, cursor_factory=RealDictCursor)
     return conn
 
 @mcp.tool()
@@ -24,19 +30,22 @@ def get_schedule(user_id: str, day_of_week: str = "") -> str:
     conn = get_db_connection()
     cursor = conn.cursor()
 
-    if day_of_week:
-        cursor.execute(
-            "SELECT * FROM courses WHERE user_id = ? AND day_of_week = ?",
-            (user_id, day_of_week)
-        )
-    else:
-        cursor.execute(
-            "SELECT * FROM courses WHERE user_id = ?",
-            (user_id,)
-        )
+    try:
+        if day_of_week:
+            cursor.execute(
+                "SELECT * FROM courses WHERE user_id = %s AND day_of_week = %s",
+                (user_id, day_of_week)
+            )
+        else:
+            cursor.execute(
+                "SELECT * FROM courses WHERE user_id = %s",
+                (user_id,)
+            )
 
-    rows = cursor.fetchall()
-    conn.close()
+        rows = cursor.fetchall()
+    finally:
+        cursor.close()
+        conn.close()
 
     if not rows:
         return f"找不到 {day_of_week if day_of_week else '任何'} 的課程資料。"
@@ -60,12 +69,16 @@ def add_course(user_id: str, course_name: str, day_of_week: str, time_slot: str,
     """
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO courses (user_id, course_name, day_of_week, time_slot, location, notes) VALUES (?, ?, ?, ?, ?, '')",
-        (user_id, course_name, day_of_week, time_slot, location)
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute(
+            "INSERT INTO courses (user_id, course_name, day_of_week, time_slot, location, notes) VALUES (%s, %s, %s, %s, %s, '')",
+            (user_id, course_name, day_of_week, time_slot, location)
+        )
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
+        
     return f"已成功新增課程：{day_of_week} {time_slot}《{course_name}》於 {location}。"
 
 @mcp.tool()
@@ -78,13 +91,16 @@ def update_course_note(user_id: str, course_name: str, note: str) -> str:
     """
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute(
-        "UPDATE courses SET notes = ? WHERE user_id = ? AND course_name LIKE ?",
-        (note, user_id, f"%{course_name}%")
-    )
-    affected = cursor.rowcount
-    conn.commit()
-    conn.close()
+    try:
+        cursor.execute(
+            "UPDATE courses SET notes = %s WHERE user_id = %s AND course_name LIKE %s",
+            (note, user_id, f"%{course_name}%")
+        )
+        affected = cursor.rowcount
+        conn.commit()
+    finally:
+        cursor.close()
+        conn.close()
 
     if affected == 0:
         return f"找不到名稱包含「{course_name}」的課程，無法更新備註。"

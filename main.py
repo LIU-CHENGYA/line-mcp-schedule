@@ -57,6 +57,7 @@ gemini_client = genai.Client(
 server_params = StdioServerParameters(
     command="uv",
     args=["run", "server.py"],
+    env={"DATABASE_URL": os.getenv("DATABASE_URL", "")}
 )
 
 mcp_session: ClientSession | None = None
